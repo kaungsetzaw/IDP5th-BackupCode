@@ -1,3 +1,17 @@
+// for platformio.ini
+//   [env:4d_systems_esp32s3_gen4_r8n16]
+// platform = espressif32@6.5.0      ; 🌟 Version 6.5.0 (Core 2.x) ကို အသေမှတ်ပါမည်
+// board = 4d_systems_esp32s3_gen4_r8n16
+// framework = arduino
+// monitor_speed = 115200
+// lib_ldf_mode = deep+
+
+// lib_deps = 
+//     Wire
+//     SPI
+//     adafruit/RTClib@^2.1.4
+
+
 #include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
