@@ -1,0 +1,247 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h> 
+#include <Preferences.h>
+#include <ESP32Servo.h> // 🆕 Servo Library
+
+// --- Configuration & Constants ---
+// ⚠️ Main Unit ၏ MAC Address အမှန်ကို ပြင်ဆင်ပါ
+uint8_t mainUnitAddress[] = {0x30, 0xED, 0xA0, 0x2C, 0x7B, 0x44}; 
+
+const int CONFIG_BTN_PIN = 0;  
+const int PH_SENSOR_PIN = 4;   
+const int TEMP_SENSOR_PIN = 5; 
+const int SERVO_PIN = 6;       // 🆕 Fish Feeder Servo Pin
+
+Preferences preferences;
+esp_now_peer_info_t peerInfo;
+int espnow_channel;
+Servo fishFeederServo; // 🆕 Servo Object
+
+// --- Timing Control ---
+unsigned long last_temp_sample_time = 0;
+unsigned long last_send_time = 0;
+const unsigned long TEMP_SAMPLE_INTERVAL = 1000; 
+const unsigned long SEND_INTERVAL = 5000;        
+
+// --- 📦 Data Structures (MUST MATCH MAIN UNIT) ---
+typedef struct fish_message {
+  int unit_id;           // Assigned ID: 3
+  float temperature;
+  float ph_level;
+  bool is_hot;           
+  bool is_bad_ph;        
+  bool is_critical;      
+} fish_message;
+
+// 🆕 Receive Command from Main Unit
+typedef struct fish_command_message {
+  int target_unit;       // 3
+  bool trigger_feeder;
+} fish_command_message;
+
+// 🆕 Send ACK back to Main Unit
+typedef struct ack_message {
+  int identifier;        // 999
+  int target_unit;       // 3
+  bool ack_success;
+  int confirmed_fan_mode;
+  bool feeding_triggered;
+  int confirmed_motor_mode; 
+} ack_message;
+
+fish_message fishData;
+fish_command_message incomingCmd;
+ack_message fishAck;
+
+// --- Feeder State ---
+bool is_feeding = false;
+unsigned long feed_start_time = 0;
+bool send_ack_flag = false;
+
+// --- Temperature Smoothing ---
+const int NUM_SAMPLES = 50; 
+const int HISTORY_SIZE = 10;
+float tempHistory[HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0; 
+float finalAvgTempC = 0.0; 
+
+// --- ESP-NOW Callbacks ---
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  if (len == sizeof(fish_command_message)) {
+    memcpy(&incomingCmd, incomingData, sizeof(incomingCmd));
+    
+    // Check if the command is meant for Fish Unit (Unit 3)
+    if (incomingCmd.target_unit == 3) { 
+      Serial.println("\n📥 [COMMAND RECEIVED FROM MAIN UNIT]");
+      
+      if (incomingCmd.trigger_feeder && !is_feeding) {
+        Serial.println(">>> ACTION: FISH FEEDING START! (180 Deg) <<<");
+        is_feeding = true;
+        feed_start_time = millis();
+        fishFeederServo.write(180); 
+      }
+      send_ack_flag = true; 
+    }
+  }
+}
+
+float get_pH_Level(int analogValue) {
+  float voltage = analogValue * (3.3 / 4095.0);
+  return 3.5 * voltage; 
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(CONFIG_BTN_PIN, INPUT_PULLUP);
+
+  // 🆕 Servo Initialization
+  Serial.println("[Init] Attaching Fish Feeder Servo...");
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  fishFeederServo.setPeriodHertz(50);
+  fishFeederServo.attach(SERVO_PIN, 500, 2400); 
+  fishFeederServo.write(90); 
+
+  preferences.begin("farm_config", false);
+  espnow_channel = preferences.getInt("main_channel", 11); 
+
+  Serial.println("\nPress BOOT Button within 3 seconds for Config Mode...");
+  delay(3000);
+
+  if (digitalRead(CONFIG_BTN_PIN) == LOW) {
+    Serial.println("\n>>> CONFIG MODE ACTIVATED <<<");
+    while (Serial.available() > 0) Serial.read(); 
+    Serial.print("Enter Main Unit WiFi Channel (1-13): ");
+    while (Serial.available() == 0) { delay(10); } 
+    String channelInput = Serial.readStringUntil('\n');
+    channelInput.trim();
+    int newChannel = channelInput.toInt();
+    if (newChannel > 0 && newChannel <= 13) {
+      preferences.putInt("main_channel", newChannel);
+      espnow_channel = newChannel;
+      Serial.printf("Channel saved: %d\n", espnow_channel);
+    }
+  }
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(espnow_channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  
+  if (esp_now_init() != ESP_OK) return;
+  
+  esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
+  esp_now_register_recv_cb((esp_now_recv_cb_t)OnDataRecv); // 🆕 Registered Recv
+  
+  memset(&peerInfo, 0, sizeof(peerInfo)); 
+  memcpy(peerInfo.peer_addr, mainUnitAddress, 6);
+  peerInfo.channel = espnow_channel;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // ==========================================
+  // Task 1: Temperature Sampling (1s)
+  // ==========================================
+  if (currentMillis - last_temp_sample_time >= TEMP_SAMPLE_INTERVAL) {
+    last_temp_sample_time = currentMillis;
+    uint32_t total_mV = 0;
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+      total_mV += analogReadMilliVolts(TEMP_SENSOR_PIN);
+      delay(2); 
+    }
+    uint32_t average_mV = total_mV / NUM_SAMPLES;
+    float currentTempC = ((average_mV - 500.0) / 10.0);
+
+    tempHistory[historyIndex] = currentTempC;
+    historyIndex = (historyIndex + 1) % HISTORY_SIZE;
+    if (historyCount < HISTORY_SIZE) historyCount++;
+
+    float sortedHistory[HISTORY_SIZE];
+    for (int i = 0; i < historyCount; i++) sortedHistory[i] = tempHistory[i];
+
+    for (int i = 0; i < historyCount - 1; i++) {
+      for (int j = 0; j < historyCount - i - 1; j++) {
+        if (sortedHistory[j] > sortedHistory[j + 1]) {
+          float temp = sortedHistory[j];
+          sortedHistory[j] = sortedHistory[j + 1];
+          sortedHistory[j + 1] = temp;
+        }
+      }
+    }
+
+    float sumTempC = 0;
+    int validSamples = 0;
+    if (historyCount == HISTORY_SIZE) {
+      for (int i = 2; i < 8; i++) { sumTempC += sortedHistory[i]; validSamples++; }
+    } else {
+      for (int i = 0; i < historyCount; i++) { sumTempC += sortedHistory[i]; validSamples++; }
+    }
+    finalAvgTempC = 3 + (sumTempC / validSamples);
+  }
+
+  // ==========================================
+  // Task 2: Data Transmission (5s)
+  // ==========================================
+  if (currentMillis - last_send_time >= SEND_INTERVAL) {
+    last_send_time = currentMillis;
+    
+    fishData.unit_id = 3; // Strict ID Check
+    fishData.temperature = finalAvgTempC; 
+    
+    int phAnalogValue = analogRead(PH_SENSOR_PIN);
+    fishData.ph_level = get_pH_Level(phAnalogValue);
+
+    fishData.is_hot = (fishData.temperature > 36.0);
+    fishData.is_bad_ph = (fishData.ph_level <= 6.0 || fishData.ph_level >= 7.8);
+    fishData.is_critical = (fishData.is_hot || fishData.is_bad_ph);
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(espnow_channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    esp_now_send(mainUnitAddress, (uint8_t *) &fishData, sizeof(fishData));
+  }
+
+  // ==========================================
+  // Task 3: Transmit Acknowledgment (ACK)
+  // ==========================================
+  if (send_ack_flag) {
+    send_ack_flag = false; 
+    
+    fishAck.identifier = 999;
+    fishAck.target_unit = 3;
+    fishAck.ack_success = true;
+    fishAck.confirmed_fan_mode = 0;
+    fishAck.feeding_triggered = incomingCmd.trigger_feeder;
+    fishAck.confirmed_motor_mode = 0; 
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(espnow_channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    esp_now_send(mainUnitAddress, (uint8_t *) &fishAck, sizeof(fishAck));
+  }
+
+  // ==========================================
+  // Task 4: Non-blocking Feeder Control (5s)
+  // ==========================================
+  if (is_feeding) {
+    if (currentMillis - feed_start_time >= 5000) {
+      fishFeederServo.write(90); 
+      is_feeding = false;
+      Serial.println("<<< ACTION: FISH FEEDING COMPLETE! Returned to 90 Deg >>>\n");
+    }
+  }
+}
